@@ -53,6 +53,20 @@ class Base_Task(gym.Env):
         - `self.right_arm_joint_id`: [7,15,19,23,27,31].
         - `self.render_fre`: Render frequency.
         """
+        # ---------------- Headless + saving defaults ----------------
+        headless = kwags.get("headless", True)
+        # default to saving data (you can still override)
+        kwags.setdefault("save_data", True)
+        # choose how often to save frames; None disables saving
+        kwags.setdefault("save_freq", 1)
+
+        # If headless, ensure no viewer is created and no render() calls are hit
+        if headless:
+            os.environ["RT_USE_VIEWER"] = "0"   # make sure viewer won't be constructed
+            kwags["render_freq"] = 0            # skip all viewer.render() branches
+
+        # ------------------------------------------------------------
+
         super().__init__()
         ta.setup_logging("CRITICAL")  # hide logging
         np.random.seed(kwags.get("seed", 0))
@@ -64,7 +78,8 @@ class Base_Task(gym.Env):
         self.save_dir = kwags.get("save_path", "data")
         self.ep_num = kwags.get("now_ep_num", 0)
         self.render_freq = kwags.get("render_freq", 10)
-        self.data_type = kwags.get("data_type", None)
+        # self.data_type = kwags.get("data_type", {None})
+        self.data_type = kwags.get("data_type", {}) 
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
@@ -72,7 +87,8 @@ class Base_Task(gym.Env):
         self.need_topp = True  # TODO
 
         # Random
-        random_setting = kwags.get("domain_randomization")
+        # random_setting = kwags.get("domain_randomization")
+        random_setting = kwags.get("domain_randomization", {})
         self.random_background = random_setting.get("random_background", False)
         self.cluttered_table = random_setting.get("cluttered_table", False)
         self.clean_background_rate = random_setting.get("clean_background_rate", 1)
@@ -255,18 +271,24 @@ class Base_Task(gym.Env):
 
         # initialize viewer with camera position and orientation
         if self.render_freq:
-            self.viewer = Viewer(self.renderer)
-            self.viewer.set_scene(self.scene)
-            self.viewer.set_camera_xyz(
-                x=kwargs.get("camera_xyz_x", 0.4),
-                y=kwargs.get("camera_xyz_y", 0.22),
-                z=kwargs.get("camera_xyz_z", 1.5),
-            )
-            self.viewer.set_camera_rpy(
-                r=kwargs.get("camera_rpy_r", 0),
-                p=kwargs.get("camera_rpy_p", -0.8),
-                y=kwargs.get("camera_rpy_y", 2.45),
-            )
+            # self.viewer = Viewer(self.renderer)
+            self.viewer = None
+            if os.environ.get("RT_USE_VIEWER", "0") == "1":
+                from sapien.utils.viewer import Viewer
+                self.viewer = Viewer(self.renderer)
+
+            if self.viewer is not None:
+                self.viewer.set_scene(self.scene)
+                self.viewer.set_camera_xyz(
+                    x=kwargs.get("camera_xyz_x", 0.4),
+                    y=kwargs.get("camera_xyz_y", 0.22),
+                    z=kwargs.get("camera_xyz_z", 1.5),
+                )
+                self.viewer.set_camera_rpy(
+                    r=kwargs.get("camera_rpy_r", 0),
+                    p=kwargs.get("camera_rpy_p", -0.8),
+                    y=kwargs.get("camera_rpy_y", 2.45),
+                )
 
     def create_table_and_wall(self, table_xy_bias=[0, 0], table_height=0.74):
         self.table_xy_bias = table_xy_bias
@@ -514,11 +536,20 @@ class Base_Task(gym.Env):
         if self.FRAME_IDX == 0:
             self.folder_path = {"cache": f"{self.save_dir}/.cache/episode{self.ep_num}/"}
 
-            for directory in self.folder_path.values():  # remove previous data
-                if os.path.exists(directory):
-                    file_list = os.listdir(directory)
-                    for file in file_list:
-                        os.remove(directory + file)
+            # Recreate the cache directory from scratch (simplest & safest)
+            try:
+                import shutil
+                shutil.rmtree(self.folder_path["cache"], ignore_errors=True)
+                os.makedirs(self.folder_path["cache"], exist_ok=True)
+            except OSError as e:
+                print(f"[WARN] Failed to reset cache folder {self.folder_path['cache']}: {e}")
+
+
+            # for directory in self.folder_path.values():  # remove previous data
+            #     if os.path.exists(directory):
+            #         file_list = os.listdir(directory)
+            #         for file in file_list:
+            #             os.remove(directory + file)
 
         pkl_dic = self.get_obs()
         save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)  # use cache

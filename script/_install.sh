@@ -1,61 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 echo "Installing the necessary packages ..."
 pip install -r script/requirements.txt
 
-echo "Installing pytorch3d ..."
-# cd third_party/pytorch3d_simplified
-# pip install -e .
-# cd ../..
+echo "Installing pytorch3d (from facebookresearch/pytorch3d@stable) ..."
+# needs ninja + cmake present in your env; you already have them via conda-forge
 pip install "git+https://github.com/facebookresearch/pytorch3d.git@stable"
 
-echo "Adjusting code in sapien/wrapper/urdf_loader.py ..."
-# location of sapien, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/sapien"
-SAPIEN_LOCATION=$(pip show sapien | grep 'Location' | awk '{print $2}')/sapien
-# Adjust some code in wrapper/urdf_loader.py
-URDF_LOADER=$SAPIEN_LOCATION/wrapper/urdf_loader.py
-# ----------- before -----------
-# 667         with open(urdf_file, "r") as f:
-# 668             urdf_string = f.read()
-# 669 
-# 670         if srdf_file is None:
-# 671             srdf_file = urdf_file[:-4] + "srdf"
-# 672         if os.path.isfile(srdf_file):
-# 673             with open(srdf_file, "r") as f:
-# 674                 self.ignore_pairs = self.parse_srdf(f.read())
-# ----------- after  -----------
-# 667         with open(urdf_file, "r", encoding="utf-8") as f:
-# 668             urdf_string = f.read()
-# 669 
-# 670         if srdf_file is None:
-# 671             srdf_file = urdf_file[:-4] + ".srdf"
-# 672         if os.path.isfile(srdf_file):
-# 673             with open(srdf_file, "r", encoding="utf-8") as f:
-# 674                 self.ignore_pairs = self.parse_srdf(f.read())
-sed -i -E 's/("r")(\))( as)/\1, encoding="utf-8") as/g' $URDF_LOADER
+echo "Patching sapien/wrapper/urdf_loader.py ..."
+SAPIEN_LOCATION="$(pip show sapien | awk '/Location/ {print $2}')/sapien"
+URDF_LOADER="$SAPIEN_LOCATION/wrapper/urdf_loader.py"
 
+if [[ -f "$URDF_LOADER" ]]; then
+  # backup before editing
+  cp "$URDF_LOADER" "${URDF_LOADER}.bak"
 
-echo "Adjusting code in mplib/planner.py ..."
-# location of mplib, like "~/.conda/envs/RoboTwin/lib/python3.10/site-packages/mplib"
-MPLIB_LOCATION=$(pip show mplib | grep 'Location' | awk '{print $2}')/mplib
+  # add encoding="utf-8" and fix .srdf extension
+  # robust two-step patch (works even if spacing differs)
+  sed -i 's/open(urdf_file, "r")/open(urdf_file, "r", encoding="utf-8")/g' "$URDF_LOADER"
+  sed -i 's/urdf_file\[:-]4\] \+\"srdf\"/urdf_file[:-4] + ".srdf"/g' "$URDF_LOADER"
 
-# Adjust some code in planner.py
-# ----------- before -----------
-# 807             if np.linalg.norm(delta_twist) < 1e-4 or collide or not within_joint_limit:
-# 808                 return {"status": "screw plan failed"}
-# ----------- after  ----------- 
-# 807             if np.linalg.norm(delta_twist) < 1e-4 or not within_joint_limit:
-# 808                 return {"status": "screw plan failed"}
-PLANNER=$MPLIB_LOCATION/planner.py
-sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not within_joint_limit:)/\1\3/g' $PLANNER
+  # also ensure srdf open uses utf-8
+  sed -i 's/open(srdf_file, "r")/open(srdf_file, "r", encoding="utf-8")/g' "$URDF_LOADER"
+else
+  echo "WARN: $URDF_LOADER not found; skipping sapien patch."
+fi
 
-echo "Installing Curobo ..."
-cd envs
-git clone https://github.com/NVlabs/curobo.git
-cd curobo
-pip install -e . --no-build-isolation
-cd ../..
+echo "Patching mplib/planner.py ..."
+MPLIB_LOCATION="$(pip show mplib | awk '/Location/ {print $2}')/mplib"
+PLANNER="$MPLIB_LOCATION/planner.py"
 
-echo "Installation basic environment complete!"
-echo -e "You need to:"
-echo -e "    1. \033[34m\033[1m(Important!)\033[0m Download asserts from huggingface."
-echo -e "    2. Install requirements for running baselines. (Optional)"
-echo "See INSTALLATION.md for more instructions."
+if [[ -f "$PLANNER" ]]; then
+  cp "$PLANNER" "${PLANNER}.bak"
+  # remove the 'or collide' part in that specific condition
+  sed -i -E 's/(if[[:space:]]+np\.linalg\.norm\(delta_twist\)[[:space:]]*<[^:]*)([[:space:]]*or[[:space:]]*collide)([[:space:]]*or[[:space:]]*not[[:space:]]+within_joint_limit:)/\1\3/' "$PLANNER"
+else
+  echo "WARN: $PLANNER not found; skipping mplib patch."
+fi
+
+echo "Installing cuRobo (skipping if already present) ..."
+if python - <<'PY' >/dev/null 2>&1; then
+import importlib; import sys
+sys.exit(0 if importlib.util.find_spec("curobo") else 1)
+PY
+then
+  echo "cuRobo already importable; skip clone/build."
+else
+  mkdir -p envs
+  if [[ ! -d envs/curobo ]]; then
+    git clone https://github.com/NVlabs/curobo.git envs/curobo
+  fi
+  pushd envs/curobo
+  # use your known-good toolchain & CUDA; avoid build isolation
+  pip install -e . --no-build-isolation
+  popd
+fi
+
+echo "Installation of the basic environment complete!"
+echo "Next:"
+echo "  1) (Important!) Download assets from HuggingFace."
+echo "  2) Optionally install extra requirements for baselines."
+echo "See INSTALLATION.md for details."

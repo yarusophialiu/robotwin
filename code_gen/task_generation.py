@@ -233,4 +233,5 @@ if __name__ == "__main__":
 """
 Usage:
 python code_gen/task_generation.py task_name
+BEAT_BLOCK_HAMMER PICK_DUAL_BOTTLES_EASY
 """

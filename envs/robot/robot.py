@@ -108,7 +108,12 @@ class Robot:
             self.left_entity = self._entity
             self.right_entity = self._entity
         else:
-            arms_dis = kwargs["embodiment_dis"]
+            # arms_dis = kwargs["embodiment_dis"]
+            arms_dis = kwargs.get("embodiment_dis", 0.7)
+            try:
+                arms_dis = float(arms_dis)
+            except Exception:
+                raise ValueError(f"embodiment_dis 必须是数值，当前为: {arms_dis!r}")
             self.left_entity_origion_pose.p += [-arms_dis / 2, 0, 0]
             self.right_entity_origion_pose.p += [arms_dis / 2, 0, 0]
             left_loader: sapien.URDFLoader = scene.create_urdf_loader()
