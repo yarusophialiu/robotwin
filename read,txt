@@ -1,0 +1,359 @@
+I dont have model,  model is spatial and head, see how the trainer works and then edit the prediction: 
+
+ 
+
+# ----- Trainer ----- 
+
+class Trainer: 
+
+    def __init__( 
+
+        self, 
+
+        model_head: nn.Module, 
+
+        spatial_backbone: nn.Module, 
+
+        num_classes: int, 
+
+        num_epochs: int, 
+
+        device: torch.device, 
+
+        ce_loss: nn.Module, # cross entropy loss 
+
+        bce_loss: Optional[nn.Module], # BCEWithLogitsLoss 
+
+        lambda_ord: float, 
+
+        out_dir: str, 
+
+        optimizer: optim.Optimizer = None, 
+
+        scheduler: Optional[_LRScheduler] = None, 
+
+        lr: float = 1e-4, 
+
+        weight_decay: float = 1e-2, 
+
+        use_amp: bool = True, 
+
+        save_every: int = 1, 
+
+        eval: bool = False 
+
+    ): 
+
+        self.head = model_head.to(device) 
+
+        self.spatial = spatial_backbone.to(device).eval()  # spatial is frozen 
+
+        for p in self.spatial.parameters(): 
+
+            p.requires_grad = False 
+
+ 
+
+        self.num_classes = num_classes 
+
+        self.device = device 
+
+        self.ce_loss = ce_loss 
+
+        self.bce_loss = bce_loss 
+
+        self.lambda_ord = lambda_ord 
+
+         
+
+        # optimizer_local = optim.AdamW([p for p in model_head.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay) 
+
+        # scheduler_local = CosineAnnealingLR(optimizer, T_max=max(num_epochs, 1)) 
+
+ 
+
+        self.optimizer = optimizer  
+
+        self.scheduler = scheduler  
+
+        self.out_dir = out_dir 
+
+        self.use_amp = use_amp 
+
+        # self.scaler = GradScaler(enabled=use_amp) 
+
+        # self.scaler = GradScaler(enabled=use_amp) 
+
+        self.save_every = save_every 
+
+        self.global_step = 0 
+
+        self.lr = lr 
+
+ 
+
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S") 
+
+        exp_name = f"exp_temporal_test_lr{self.lr}_" + date_str 
+
+        self.out_dir = os.path.join(self.out_dir, exp_name) 
+
+        if not eval: 
+
+            self.writer = LoggedWriter(log_dir=self.out_dir) 
+
+            os.makedirs(self.out_dir, exist_ok=True) 
+
+            print(f"🔹 Saving outputs to: {self.out_dir}") 
+
+ 
+
+ 
+
+    @staticmethod 
+
+    def _get_lr(optimizer): 
+
+        for g in optimizer.param_groups: 
+
+            if "lr" in g: 
+
+                return float(g["lr"]) 
+
+        return None 
+
+ 
+
+ 
+
+    def _forward_batch(self, batch, train: bool = True, SHOW_WEIGHTED_LOSS: bool = False, TEST_EVAL: bool = False): 
+
+        rgb = batch["rgb"].to(self.device, non_blocking=True)        # [B,T,C,H,W] 
+
+        motion = batch["motion"].to(self.device, non_blocking=True)  # [B,Cm,T,H,W] 
+
+        target = batch["label"].to(self.device, non_blocking=True)   # [B] 
+
+ 
+
+        B, T, C, H, W = rgb.shape 
+
+        frames = rgb.view(B * T, C, H, W) 
+
+ 
+
+        with torch.no_grad(): 
+
+        # per-frame spatial features, then reshape to [B,T,Ds] 
+
+            s_feats = self.spatial(frames).view(B, T, -1) 
+
+ 
+
+        # with autocast(enabled=self.use_amp, device_type='cuda'): 
+
+        # logits is raw unnormalized scores float 
+
+        logits, ord_logits, _ = self.head(motion, s_feats, return_att=True) 
+
+        loss = self.ce_loss(logits, target) 
+
+        ord_loss = None 
+
+        if (self.bce_loss is not None) and (ord_logits is not None): 
+
+            ord_tgts = build_ordinal_targets(target, self.num_classes) 
+
+            ord_loss = self.bce_loss(ord_logits, ord_tgts).mean() 
+
+            loss = loss + self.lambda_ord * ord_loss 
+
+            lambda_ord_loss = self.lambda_ord * ord_loss 
+
+            # print(f'ce_loss {self.ce_loss(logits, target)}, loss {loss}\n') 
+
+ 
+
+        acc = top1_accuracy(logits.detach(), target) 
+
+        macro_acc = macro_accuracy(logits.detach(), target) 
+
+ 
+
+        logs = { 
+
+            "loss": float(loss.detach().item()), 
+
+            "ce_loss": float(self.ce_loss(logits, target).detach().item()), 
+
+            "ord_loss": float(ord_loss.detach().item()) if ord_loss is not None else 0, 
+
+            "lambda_ord_loss": float(lambda_ord_loss.detach().item()) if ord_loss is not None else 0, 
+
+            "acc": acc, 
+
+            "macro_acc": macro_acc, 
+
+        } 
+
+@torch.no_grad() 
+
+    def evaluate_test(self, loader) -> Tuple[float, float, float, torch.Tensor, torch.Tensor]: 
+
+        """ 
+
+        Test-time eval: returns metrics + all predictions and targets 
+
+        for confusion matrix / saving. 
+
+        """ 
+
+        self.head.eval() 
+
+        total_loss, total_acc, total_macro, n = 0.0, 0.0, 0.0, 0 
+
+ 
+
+        all_preds = [] 
+
+        all_targets = [] 
+
+ 
+
+        jod_preds = []   # JOD at predicted resolution 
+
+        jod_tgts  = []   # JOD at target resolution 
+
+        jod_map = loader.dataset.jod_map  # (scene_name, start, res) -> jod 
+
+ 
+
+        for batch in loader: 
+
+            loss, acc, logs, preds, targets = self._forward_batch( 
+
+                batch, 
+
+                train=False, 
+
+                SHOW_WEIGHTED_LOSS=False, 
+
+                TEST_EVAL=True, 
+
+            ) 
+
+            total_loss += float(loss.item()) 
+
+            total_acc += float(acc) 
+
+            total_macro += float(logs["macro_acc"]) 
+
+            n += 1 
+
+ 
+
+            preds_indices = preds.cpu().tolist() # Converts tensor to a Python list: [0, 1, 0] 
+
+            preds_labels = [IDX_TO_LABEL[i] for i in preds_indices] 
+
+            targets_indices = targets.cpu().tolist() # Converts tensor to a Python list: [0, 1, 0] 
+
+            targets_labels = [IDX_TO_LABEL[i] for i in targets_indices] 
+
+ 
+
+            all_preds.append(torch.tensor(preds_labels)) 
+
+            all_targets.append(torch.tensor(targets_labels)) 
+
+ 
+
+            meta = batch["meta"] 
+
+            # meta is a dict of lists / tensors with batch dimension 
+
+            scene_names = meta["scene_name"]             # list of str, len=B 
+
+            scene_dists = meta["scene_dist"]             # list[str], len=B 
+
+            starts      = meta["start"]                  # tensor [B] 
+
+            label_vals  = meta["label_value"]            # tensor [B], resolution values 
+
+            preds_cpu = preds.cpu() 
+
+            B = preds_cpu.shape[0] 
+
+            # print(f'jod_map {jod_map}') 
+
+            # print(f'IDX_TO_LABEL {IDX_TO_LABEL}') 
+
+            for i in range(B): 
+
+                scene_dist = scene_dists[i] 
+
+                start_i = int(starts[i].item()) 
+
+                tgt_res = int(label_vals[i].item())          # target resolution (value) 
+
+                pred_idx = int(preds_cpu[i].item()) 
+
+                pred_res = IDX_TO_LABEL[pred_idx]            # predicted resolution (value) 
+
+ 
+
+                key_tgt  = (scene_dist, start_i, tgt_res) 
+
+                key_pred = (scene_dist, start_i, pred_res) 
+
+                # print(f'key_tgt {key_tgt}') 
+
+                # print(f'key_pred {key_pred}') 
+
+ 
+
+                if key_tgt not in jod_map or key_pred not in jod_map: 
+
+                    continue 
+
+ 
+
+                jod_tgts.append(jod_map[key_tgt]) 
+
+                jod_preds.append(jod_map[key_pred]) 
+
+                # print(f'jod_map[key_pred] {jod_map[key_pred]}') 
+
+                # print(f'jod_tgts {jod_tgts}') 
+
+        # print(f'jod_preds {jod_preds}') 
+
+        denom = max(n, 1) 
+
+        test_loss = total_loss / denom 
+
+        test_acc = total_acc / denom 
+
+        macro_acc = total_macro / denom 
+
+ 
+
+        if all_preds: 
+
+            all_preds = torch.cat(all_preds, dim=0) 
+
+            all_targets = torch.cat(all_targets, dim=0) 
+
+        else: 
+
+            all_preds = torch.empty(0, dtype=torch.long) 
+
+            all_targets = torch.empty(0, dtype=torch.long) 
+
+ 
+
+        return test_loss, test_acc, macro_acc, all_preds, all_targets, jod_preds, jod_tgts 
+
+ 
+
+ 
