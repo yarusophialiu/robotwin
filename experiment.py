@@ -5,194 +5,282 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 
 import torch
+import torch.nn as nn
 from PIL import Image
 import torchvision.transforms as T
 
-# -----------------------------
+# =========================
 # Config
-# -----------------------------
+# =========================
 class Config:
     PTH_DIR = "ablation_exp_temporal_test_lr1e-05_20251108_074902"
-    CKPT_NAME = "best.pth"  # change if needed
-    TEST_DIR = "/path/to/your/test/dir"  # <- set this
-    OUTPUT_DIR = "predictions_out"       # where to save per-scene predictions
-    START_RES = (1080, 1920)             # starting at *_from1080x1920
-    CLIP_LEN = 31                        # frames per step (0..30, 31..61, ...)
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    CKPT_NAME = "best.pth"
+    TEST_DIR = "PATH/TO/Config.TEST_DIR"      # <-- set this
+    OUTPUT_DIR = "predictions_out"
+    START_RES = (1080, 1920)
+    CLIP_LEN = 31                              # frames per hop (0..30, 31..61, ...)
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    IMG_TO_TENSOR = T.Compose([T.ToTensor()])  # adapt normalization to match training
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# =========================
+# Checkpoint loading
+# =========================
+def load_checkpoint(ckpt_path: str):
+    """
+    Tries a few common layouts:
+    - {'spatial': state_dict, 'head': state_dict, 'idx_to_label': list/dict}
+    - {'model': {'spatial':..., 'head':...}, 'idx_to_label': ...}
+    - {'state_dict': ...} where keys are 'spatial.*' and 'head.*'
+    Returns: (spatial_module, head_module, idx_to_label)
+    You MUST replace `build_spatial()` and `build_head(num_classes)` with your constructors.
+    """
+    blob = torch.load(ckpt_path, map_location="cpu")
+
+    # You must implement these two to match your training code:
+    def build_spatial() -> nn.Module:
+        # e.g., return YourBackbone(...)
+        raise NotImplementedError("Provide your spatial backbone definition here.")
+
+    def build_head(num_classes: int) -> nn.Module:
+        # e.g., return YourTemporalHead(num_classes=num_classes, ...)
+        raise NotImplementedError("Provide your head definition here.")
+
+    # Try to recover idx_to_label
+    idx_to_label = None
+    if isinstance(blob, dict):
+        for k in ["idx_to_label", "IDX_TO_LABEL", "label_map", "classes"]:
+            if k in blob:
+                idx_to_label = blob[k]
+
+    # Case A: explicit 'spatial' and 'head'
+    if "spatial" in blob and "head" in blob:
+        # Need num_classes for head init; infer from idx_to_label if present
+        if idx_to_label is None:
+            raise RuntimeError("Checkpoint missing idx_to_label. Please include mapping or hardcode it.")
+        num_classes = len(idx_to_label) if hasattr(idx_to_label, "__len__") else int(max(idx_to_label)+1)
+        spatial = build_spatial()
+        head = build_head(num_classes)
+        spatial.load_state_dict(blob["spatial"])
+        head.load_state_dict(blob["head"])
+        return spatial, head, idx_to_label
+
+    # Case B: 'model' contains submodules
+    if "model" in blob and isinstance(blob["model"], dict) and \
+       "spatial" in blob["model"] and "head" in blob["model"]:
+        if idx_to_label is None:
+            raise RuntimeError("Checkpoint missing idx_to_label. Please include mapping or hardcode it.")
+        num_classes = len(idx_to_label) if hasattr(idx_to_label, "__len__") else int(max(idx_to_label)+1)
+        spatial = build_spatial()
+        head = build_head(num_classes)
+        spatial.load_state_dict(blob["model"]["spatial"])
+        head.load_state_dict(blob["model"]["head"])
+        return spatial, head, idx_to_label
+
+    # Case C: single flat state_dict with 'spatial.' and 'head.' prefixes
+    state_dict = blob.get("state_dict", blob if isinstance(blob, dict) else None)
+    if isinstance(state_dict, dict) and any(k.startswith("spatial.") for k in state_dict.keys()):
+        if idx_to_label is None:
+            raise RuntimeError("Checkpoint missing idx_to_label. Please include mapping or hardcode it.")
+        num_classes = len(idx_to_label) if hasattr(idx_to_label, "__len__") else int(max(idx_to_label)+1)
+        spatial = build_spatial()
+        head = build_head(num_classes)
+
+        # split and load
+        spatial_sd = {k.replace("spatial.", "", 1): v for k, v in state_dict.items() if k.startswith("spatial.")}
+        head_sd    = {k.replace("head.", "", 1): v for k, v in state_dict.items() if k.startswith("head.")}
+        spatial.load_state_dict(spatial_sd)
+        head.load_state_dict(head_sd)
+        return spatial, head, idx_to_label
+
+    raise RuntimeError("Unrecognized checkpoint format. Please adapt the loader to your saved structure.")
+
+# =========================
+# Data helpers
+# =========================
 RES_RX = re.compile(r"_from(\d+)x(\d+)$")
 
-def find_scene_distortion_folders(root: str) -> Dict[str, Dict[str, Dict[Tuple[int,int], str]]]:
+def scan_test_tree(root: str) -> Dict[str, Dict[str, Dict[Tuple[int,int], str]]]:
     """
-    Walk Config.TEST_DIR and collect:
-      scenes[scene][distortion][(H,W)] -> path_to_folder
-    where leaf folders are like: <TEST_DIR>/<Scene>/<Distortion>_fromHxW
+    Build mapping: scenes[scene][dist][(H,W)] -> folder path
+    Accepts leaf folder names like: 'normal_from360x640'
     """
     scene_map: Dict[str, Dict[str, Dict[Tuple[int,int], str]]] = {}
-    for scene_dir in sorted(Path(root).iterdir()):
-        if not scene_dir.is_dir():
-            continue
+    root_p = Path(root)
+    for scene_dir in sorted([p for p in root_p.iterdir() if p.is_dir()]):
         scene = scene_dir.name
         scene_map.setdefault(scene, {})
-        for dist_dir in sorted(scene_dir.iterdir()):
-            if not dist_dir.is_dir():
-                continue
-            m = RES_RX.search(dist_dir.name)
+        for leaf in sorted([p for p in scene_dir.iterdir() if p.is_dir()]):
+            m = RES_RX.search(leaf.name)
             if not m:
-                # Handle pattern like BurnedTrees-2/normal_from360x640 etc.
-                # If the distortion folder has more nesting, add handling here.
                 continue
             H, W = int(m.group(1)), int(m.group(2))
-
-            # derive pure distortion name (strip the trailing _fromHxW)
-            # e.g., "normal_from360x640" -> "normal"
-            base = dist_dir.name
-            distortion = base[:base.rfind("_from")]
-            scene_map[scene].setdefault(distortion, {})
-            scene_map[scene][distortion][(H, W)] = str(dist_dir)
+            dist = leaf.name[:leaf.name.rfind("_from")]
+            scene_map[scene].setdefault(dist, {})
+            scene_map[scene][dist][(H, W)] = str(leaf)
     return scene_map
 
 def list_frames(folder: str) -> List[str]:
-    frames = sorted([p for p in Path(folder).glob("frame_*.png")])
-    return [str(p) for p in frames]
+    paths = sorted(Path(folder).glob("frame_*.png"))
+    return [str(p) for p in paths]
 
-def load_clip(frames: List[str]) -> torch.Tensor:
+def load_clip_tensor(frame_paths: List[str]) -> torch.Tensor:
     """
-    Load a list of frame paths into a (T, C, H, W) tensor.
-    TODO: Adjust transforms to what your model expects.
+    Loads frames -> (T, C, H, W) in [0,1].
+    Apply the SAME normalization you used in training if applicable.
     """
-    # Example: convert to tensor in [0,1], no resizing here
-    tfm = T.Compose([T.ToTensor()])
     imgs = []
-    for f in frames:
-        img = Image.open(f).convert("RGB")
-        imgs.append(tfm(img))
-    clip = torch.stack(imgs, dim=0)  # (T, C, H, W)
-    return clip
+    for fp in frame_paths:
+        im = Image.open(fp).convert("RGB")
+        imgs.append(Config.IMG_TO_TENSOR(im))
+    return torch.stack(imgs, dim=0)  # (T,C,H,W)
 
-# -----------------------------
-# Model bits (fill these in)
-# -----------------------------
-def load_model(ckpt_path: str) -> torch.nn.Module:
+# =========================
+# Motion hook (implement to match training)
+# =========================
+def build_motion(rgb_clip: torch.Tensor) -> torch.Tensor:
     """
-    TODO: Replace with your model and state_dict loading.
+    Build a motion tensor of shape (1, C_m, T, H, W) to feed the head.
+    Replace with your training-time motion pipeline (e.g., optical flow stacks).
+    Placeholder: simple frame-diff stack with Cm=1.
     """
-    # Example skeleton:
-    model = torch.nn.Identity()  # <- replace with your model class
-    state = torch.load(ckpt_path, map_location="cpu")
-    # If you saved directly model.state_dict():
-    # model.load_state_dict(state)
-    # If you saved a dict: {"model": state_dict, ...}
-    # model.load_state_dict(state["model"])
-    model.eval()
-    return model
+    # rgb_clip: (T, C, H, W) in [0,1]
+    # Simple diff on luminance as placeholder
+    with torch.no_grad():
+        T_len, _, H, W = rgb_clip.shape
+        if T_len < 2:
+            diff = torch.zeros(1, 1, T_len, H, W, dtype=rgb_clip.dtype)
+            return diff
+        # convert to grayscale
+        gray = 0.2989 * rgb_clip[:,0] + 0.5870 * rgb_clip[:,1] + 0.1140 * rgb_clip[:,2]  # (T,H,W)
+        d = torch.zeros(T_len, H, W, dtype=rgb_clip.dtype)
+        d[1:] = (gray[1:] - gray[:-1]).abs()
+        d = d.unsqueeze(0).unsqueeze(0)  # (1,1,T,H,W)
+        return d
 
-def preprocess_for_model(clip: torch.Tensor) -> torch.Tensor:
+# =========================
+# Prediction glue (mirrors Trainer._forward_batch)
+# =========================
+@torch.no_grad()
+def predict_res_for_clip(spatial: nn.Module,
+                         head: nn.Module,
+                         rgb_clip: torch.Tensor,
+                         idx_to_label) -> Tuple[int, int]:
     """
-    TODO: Resize/normalize/rearrange to model's expected input.
-    E.g., if your model expects (B, C, T, H, W) and fixed spatial size:
+    rgb_clip: (T,C,H,W), values in [0,1]
+    idx_to_label: list/dict mapping class index -> resolution value (e.g., 360,480,720,1080)
+                  If it's a dict of {idx: 720}, convert to list in order.
+    Returns (H, W)
     """
-    # Example: move to (B, C, T, H, W)
-    clip = clip.permute(1, 0, 2, 3).unsqueeze(0)  # (1, C, T, H, W)
-    return clip
+    device = Config.DEVICE
+    spatial.eval()
+    head.eval()
 
-def decode_prediction_to_resolution(model_out: torch.Tensor) -> Tuple[int, int]:
-    """
-    TODO: Map model output to (H, W). For classification, argmax -> index -> (H,W).
-    For regression, round/clip to nearest allowed (H,W).
-    """
-    # Placeholder: return 720x1280 for demo
-    return (720, 1280)
+    # Make inputs like Trainer: frames = rgb.view(B*T,C,H,W) with B=1
+    T_len, C, H, W = rgb_clip.shape
+    frames = rgb_clip.to(device).unsqueeze(0)          # (1,T,C,H,W)
+    flat   = frames.view(T_len, C, H, W)               # (T,C,H,W)
 
-# If classification, define your allowed resolution set and a mapping:
-# ALLOWED_RES = [(360,640), (480,854), (720,1280), (1080,1920)]
-# def decode_prediction_to_resolution(model_out):
-#     idx = model_out.argmax(dim=1).item()
-#     return ALLOWED_RES[idx]
+    # Spatial per-frame -> (1, T, D)
+    s_feats = spatial(flat).view(1, T_len, -1)
 
-# -----------------------------
-# Orchestrator
-# -----------------------------
-def run_chain_for_distortion(model, folders_by_res: Dict[Tuple[int,int], str],
-                             out_fh, scene: str, distortion: str):
+    # Motion -> (1, C_m, T, H, W)
+    motion = build_motion(rgb_clip).to(device)
+
+    # Head forward
+    logits, ord_logits, _ = head(motion, s_feats, return_att=True)  # logits: (1, num_classes)
+    pred_idx = int(torch.argmax(logits, dim=1).item())
+
+    # idx_to_label could be list [360,480,720,1080] or dict {0:360,...}
+    if isinstance(idx_to_label, dict):
+        # ensure contiguous from 0..K-1
+        label_val = idx_to_label[pred_idx]
+    else:
+        label_val = idx_to_label[pred_idx]
+
+    # Map the scalar label to (H,W). If your label directly equals H (e.g., 720),
+    # infer W by aspect ratio used in your test tree, e.g., 16:9 -> W = round(H/9*16) or read from folder names.
+    # Safer: read available resolutions on disk and pick the one with this H.
+    return int(label_val), infer_width_from_disk_if_possible(int(label_val))
+
+def infer_width_from_disk_if_possible(H_pred: int) -> int:
     """
-    For a given distortion of a scene:
-      start at START_RES; take frames [0..30]; predict (H1,W1); write;
-      then switch to folder *_fromH1xW1; take frames [31..61]; predict (H2,W2); write; etc.
+    If your widths are fixed (e.g., 16:9), replace with a direct mapping.
+    Otherwise, this function is a placeholder. Default to 16:9 rounding.
     """
+    # 16:9 default:
+    return int(round(H_pred * 16 / 9))
+
+# =========================
+# Orchestration (chain hop)
+# =========================
+def run_chain_for_distortion(spatial, head, res2folder: Dict[Tuple[int,int], str],
+                             out_fh, scene: str, distortion: str, idx_to_label):
     step = 0
-    current_res = Config.START_RES
+    cur_res = Config.START_RES
 
-    if current_res not in folders_by_res:
-        print(f"  [WARN] Missing start folder for {distortion}: *_from{current_res[0]}x{current_res[1]}")
+    if cur_res not in res2folder:
+        print(f"  [WARN] Missing start folder {distortion}_from{cur_res[0]}x{cur_res[1]}")
         return
 
-    # While we can find the current resolution folder and enough frames to take a next clip window
     while True:
-        current_folder = folders_by_res.get(current_res)
-        if current_folder is None:
-            print(f"  [STOP] No folder for predicted resolution {current_res} for {distortion}.")
+        folder = res2folder.get(cur_res)
+        if folder is None:
+            print(f"  [STOP] No folder for predicted res {cur_res} under {distortion}")
             break
 
-        frames = list_frames(current_folder)
-        start_idx = step * Config.CLIP_LEN
-        end_idx = start_idx + Config.CLIP_LEN  # exclusive
-        if end_idx > len(frames):
-            print(f"  [STOP] Not enough frames in {Path(current_folder).name}: "
-                  f"need {Config.CLIP_LEN} frames from {start_idx}, have {len(frames)}.")
+        frames = list_frames(folder)
+        start = step * Config.CLIP_LEN
+        end = start + Config.CLIP_LEN
+        if end > len(frames):
+            print(f"  [STOP] Not enough frames in {Path(folder).name}: need {Config.CLIP_LEN} from {start}, have {len(frames)}")
             break
 
-        clip_paths = frames[start_idx:end_idx]
-        clip = load_clip(clip_paths).to(Config.DEVICE)
-        inp = preprocess_for_model(clip)
+        clip_paths = frames[start:end]
+        rgb_clip = load_clip_tensor(clip_paths)  # (T,C,H,W)
 
-        with torch.no_grad():
-            out = model(inp)
+        pred_h, pred_w = predict_res_for_clip(spatial, head, rgb_clip, idx_to_label)
 
-        pred_h, pred_w = decode_prediction_to_resolution(out)
-
-        # Write a record
-        record = {
+        rec = {
             "scene": scene,
             "distortion": distortion,
             "step": step,
-            "source_folder": Path(current_folder).name,
-            "frame_start": start_idx,
-            "frame_end_inclusive": end_idx - 1,
-            "pred_h": pred_h,
-            "pred_w": pred_w
+            "source_folder": Path(folder).name,
+            "frame_start": start,
+            "frame_end_inclusive": end - 1,
+            "pred_h": int(pred_h),
+            "pred_w": int(pred_w),
         }
-        out_fh.write(json.dumps(record) + "\n")
+        out_fh.write(json.dumps(rec) + "\n")
 
-        # Prepare next hop
-        next_res = (pred_h, pred_w)
-        if next_res == current_res and (start_idx + Config.CLIP_LEN) >= len(frames):
-            # No progress and no more frames to consume here — stop to avoid infinite loop
-            print(f"  [STOP] Predicted same resolution and no additional frames; stopping for safety.")
-            break
-
-        current_res = next_res
+        next_res = (int(pred_h), int(pred_w))
+        if next_res == cur_res:
+            # progress only if we still have more frames to consume at this res
+            if end >= len(frames):
+                print("  [STOP] Predicted same resolution and no new frames to consume.")
+                break
+        cur_res = next_res
         step += 1
 
 def main():
-    os.makedirs(Config.OFFSET_OUTPUT_DIR if hasattr(Config, "OFFSET_OUTPUT_DIR") else Config.OUTPUT_DIR, exist_ok=True)
+    os.makedirs(Config.OUT_DIR if hasattr(Config, "OUT_DIR") else Config.OUTPUT_DIR, exist_ok=True)
     ckpt_path = os.path.join(Config.PTH_DIR, Config.CKPT_NAME)
     assert os.path.isfile(ckpt_path), f"Checkpoint not found: {ckpt_path}"
 
-    model = load_model(ckpt_path).to(Config.DEVICE)
-    scenes = find_scene_distortion_folders(Config.TEST_DIR)
+    # Build modules and load weights
+    spatial, head, idx_to_label = load_checkpoint(ckpt_path)
+    spatial = spatial.to(Config.DEVICE).eval()
+    head = head.to(Config.DEVICE).eval()
 
-    # One newline-delimited JSON file per scene (aggregates all distortions)
-    for scene, distortions in scenes.items():
+    # Scan test tree
+    scenes = scan_test_tree(Config.TEST_DIR)
+
+    for scene, dmap in scenes.items():
         out_path = os.path.join(Config.OUTPUT_DIR, f"{scene}_preds.ndjson")
         print(f"[SCENE] {scene} -> {out_path}")
         with open(out_path, "w", encoding="utf-8") as out_fh:
-            for distortion, res_map in distortions.items():
-                print(f"  [DIST] {distortion} (resolutions: {sorted(res_map.keys())})")
-                run_chain_for_distortion(model, res_map, out_fh, scene, distortion)
+            for distortion, res_map in dmap.items():
+                print(f"  [DIST] {distortion} (res: {sorted(res_map.keys())})")
+                run_chain_for_distortion(spatial, head, res_map, out_fh, scene, distortion, idx_to_label)
 
     print("Done.")
 
