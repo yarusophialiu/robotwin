@@ -1,49 +1,15 @@
-[SCENE] BurnedTrees-2 -> predictions_out/BurnedTrees-2_preds.ndjson
-  [DIST] normal (res: [(360, 640), (480, 854), (720, 1280), (864, 1536)])
-  [WARN] Missing start folder normal_from1080x1920
-  [DIST] normal_with_TSR (res: [(360, 640), (480, 854), (720, 1280), (864, 1536)])
-  [WARN] Missing start folder normal_with_TSR_from1080x1920
-  [DIST] setting_4 (res: [(360, 640), (480, 854), (720, 1280), (864, 1536), (1080, 1920)])
-motion torch.Size([1, 2, 31, 518, 518])
-Traceback (most recent call last):
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/runpy.py", line 196, in _run_module_as_main
-    return _run_code(code, main_globals, None,
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/runpy.py", line 86, in _run_code
-    exec(code, run_globals)
-  File "/home/yarul/workspace/res-classifier/eval/experiment.py", line 442, in <module>
-    main(temporal_best_pth_dir)
-  File "/home/yarul/workspace/res-classifier/eval/experiment.py", line 432, in main
-    run_chain_for_distortion(spatial, head, res_map, out_fh, scene, distortion)
-  File "/home/yarul/workspace/res-classifier/eval/experiment.py", line 374, in run_chain_for_distortion
-    pred_h, pred_w = predict_res_for_clip(spatial, head, rgb_clip, clip_paths)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
-    return func(*args, **kwargs)
-  File "/home/yarul/workspace/res-classifier/eval/experiment.py", line 184, in predict_res_for_clip
-    logits, ord_logits, _ = head(motion, s_feats, return_att=True)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/yarul/workspace/res-classifier/models/temporal_classifier.py", line 143, in forward
-    z = self.motion_enc(motion_x)            # [B,T,Dm]
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/yarul/workspace/res-classifier/models/motion.py", line 33, in forward
-    x = self.net(x) # [B,64,T',1,1]
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/container.py", line 244, in forward
-    input = module(input)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1773, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1784, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 717, in forward
-    return self._conv_forward(input, self.weight, self.bias)
-  File "/home/yarul/anaconda3/envs/encode/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 712, in _conv_forward
-    return F.conv3d(
-RuntimeError: Given groups=1, weight of size [16, 2, 3, 7, 7], expected input[1, 31, 2, 518, 518] to have 2 channels, but got 31 channels instead
+@torch.no_grad()
+def build_motion(rgb_clip_paths_abs: List[str]) -> torch.Tensor:
+    """
+    Build motion as your dataset does:
+      per-frame EXR -> [2,h,w], stack -> [T,2,h,w], then batch -> [1,T,2,h,w]
+    """
+    mv_frames = []
+    for abs_fp in rgb_clip_paths_abs:
+        rel_fp = _abs_to_rel_under_test_dir(abs_fp)
+        exr_path = _cached_mv_path(Config.MV_CACHE_DIR, rel_fp)
+        mv = read_mv_exr(exr_path)          # [2,h,w], float32
+        mv_frames.append(torch.from_numpy(mv))
+    motion = torch.stack(mv_frames, dim=0)  # [T,2,h,w]
+    motion = motion.unsqueeze(0)            # [1,T,2,h,w]  <-- IMPORTANT
+    return motion
