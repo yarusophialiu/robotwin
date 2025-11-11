@@ -18,8 +18,13 @@ FINAL_SIZE = (1920, 1080)                # (width, height)
 RESIZE_FILTER = cv2.INTER_LANCZOS4       # "Lanczos"
 UPSCALE_FILTER = cv2.INTER_NEAREST       # final 1920x1080 using nearest neighbor
 PAD_MISSING_OK = False                   # if True, skip missing frames; if False, raise
-EXR_SUFFIX = "after_tonemappling"        # as you wrote it
+EXR_SUFFIX = "after_tonemapping"        # as you wrote it
 ALLOWED_EXT = ".exr"
+
+
+# --- enable EXR support in OpenCV ---
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
@@ -98,8 +103,10 @@ def process_clip(scene_name: str,
         return
 
     ensure_dir(out_dir)
-    out_name = f"{scene_name}_{dist}_{tag}_{label_height}p_120fps.mp4"
+    out_name = f"{scene_name}_{dist}.mp4"
     out_path = out_dir / out_name
+    # print(f'out_path {out_path}')
+    # sys.exit()
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out_path), fourcc, FPS, FINAL_SIZE, True)
@@ -115,6 +122,7 @@ def process_clip(scene_name: str,
         if frame_path is None:
             msg = f"[{'SKIP' if PAD_MISSING_OK else 'ERR'}] Missing EXR for idx={idx} in {src_dir}"
             print(msg)
+            sys.exit()
             if PAD_MISSING_OK:
                 continue
             else:
@@ -170,8 +178,8 @@ def main():
         max_h  = int(row["max_jod_label"])
 
         # Output dirs include OUT_ROOT / scene / dist / tag
-        out_dir_drop = OUT_ROOT / scene / dist / "video_drop_jod"
-        out_dir_max  = OUT_ROOT / scene / dist / "video_max_jod"
+        out_dir_drop = OUT_ROOT /  "video_drop_jod"
+        out_dir_max  = OUT_ROOT /  "video_max_jod"
 
         try:
             process_clip(scene, dist, start, T, stride, max_h,  "max_jod",  out_dir_max)
