@@ -1,0 +1,304 @@
+
+class TemporalResidualClassifierHead(nn.Module):
+    """
+    时序分类头（可选融合 DINOv2 等帧级特征）
+
+    输入:
+      motion_x:   [B, C, T, H, W]      光流/帧差等运动输入 (必须)
+      spatial_seq:可选 [B, T, Ds]      每帧空间特征 (如 DINOv2 的帧级特征), 若不提供则仅用运动路径
+                 也可传 [B, Ds] (已做过时序汇聚的全局空间特征)，将自动广播到 T 后再汇聚
+    输出:
+      logits:     [B, num_classes]
+      ord_logits: [B, num_classes-1] 或 None
+      attw:       [B, T]               注意力时间权重（来自运动路径的 attention pool）
+    """
+    def __init__(
+        self,
+        motion_in_ch: int = 2,
+        motion_dim: int = 96, # TODO: 96 128
+        num_classes: int = 5,
+        use_ordinal: bool = False,
+        # --- optional fusion with spatial features ---
+        fuse_spatial: bool = False,
+        spatial_dim: int = 384,      # e.g., DINOv2 ViT-S/14 cls/reg维度
+        fusion_mode: str = "gated_add", # ["concat", "gated_add"]
+        hidden_dim: int = 64, # TODO: 64  128
+        dropout: float = 0.3,
+        use_motion: bool = True # False,
+    ):
+        super().__init__()
+        self.use_ordinal = use_ordinal
+        self.fuse_spatial = fuse_spatial
+        self.fusion_mode = fusion_mode
+
+        self.use_motion = use_motion
+        self.hidden_dim = hidden_dim     
+        print(f'User motion {self.use_motion}')     
+
+        # 运动编码: [B,C,T,H,W] -> [B,T,Dm]
+        print(f'TemporalResidualClassifierHead motion_dim {motion_dim}, hidden_dim {hidden_dim}')
+        self.motion_enc = MotionEncoder3D(in_ch=motion_in_ch, out_dim=motion_dim)
+        # self.temporal = make_temporal_transformer(motion_dim, depth=2, heads=8)
+        
+        # 时间注意力汇聚: [B,T,Dm] -> ([B,Dm], [B,T])
+        # how to weight each frame when aggregating over time
+        self.pool = AttentionPool1D(motion_dim)
+
+        # 把运动编码后的特征投影到一个新的表征空间
+        # 运动分支提取到的低层特征（spatio-temporal embedding），可能
+        # 统计分布不稳定（不同 batch 间均值、方差差异大）；
+        # 维度太高或不适合与其他分支（如 DINOv2）直接融合；
+        # 还没有经过非线性映射激活
+        self.proj_motion = nn.Sequential(
+            nn.LayerNorm(motion_dim), # LayerNorm 会让每个样本的特征均值变为 0，标准差变为 1
+            nn.Linear(motion_dim, hidden_dim),
+            nn.GELU() # 平滑非线性激活函数， 与 ReLU 相比，GELU 不会“硬截断”负数，而是按概率平滑抑制，更适合 Transformer 风格网络
+        )
+
+#         if use_ordinal:
+#             self.fc_ord = nn.Linear(motion_dim, num_classes - 1)
+
+        # 空间侧（可选）投影
+        # DINOv2 和运动分支（MotionEncoder3D）的特征对齐到同一维度
+        # 以不同策略（concat / gated_add）进行融合
+        if self.fuse_spatial:
+            self.proj_spatial = nn.Sequential(
+                # 对空间特征每个样本的所有维度归一化；
+                # 让不同来源（空间/运动）的特征在数值分布上更接近。
+                nn.LayerNorm(spatial_dim),
+                # 把 DINOv2 的输出维度（如 384 或 768）映射到与运动特征相同的 256；
+                nn.Linear(spatial_dim, hidden_dim),
+                # 增加非线性，让空间特征经过轻微变换后更有表达力。
+                nn.GELU()
+            )
+            if self.fusion_mode == "concat":
+                fused_in = hidden_dim * 2
+            elif self.fusion_mode == "gated_add":
+                # 让模型自动学习“该用多少空间特征”。
+                # 门控加权: m + σ(W[ m || s ]) * s
+                self.gate = nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.Sigmoid()
+                )
+                fused_in = hidden_dim
+            else:
+                raise ValueError(f"Unsupported fusion_mode: {self.fusion_mode}")
+        else:
+            fused_in = hidden_dim
+
+        # 头部 MLP
+        self.head = nn.Sequential(
+            nn.LayerNorm(fused_in),
+            # nn.Dropout(p) randomly sets a fraction p of the input elements to zero during training.
+            # prevent overfitting and improves generalization.
+            nn.Dropout(dropout),
+            nn.Linear(fused_in, fused_in),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        # 分类头
+        self.fc = nn.Linear(fused_in, num_classes)
+        # ordinal regression
+        # 它会多输出一组 logits，用于建模“分辨率等级之间的次序关系”
+        # 任务目标是 “预测最小能让 JOD≈9 的分辨率”，
+        # 预测错误成相邻的分辨率（如把 720p 误成 864p）
+        # 比误成 360p 的代价要小
+        if self.use_ordinal:
+            self.fc_ord = nn.Linear(fused_in, num_classes - 1)
+        else:
+            self.fc_ord = None
+
+    @staticmethod
+    def _ensure_bt_feat(spatial_seq: torch.Tensor, T: int) -> torch.Tensor:
+        """
+        将 [B,Ds] 或 [B,T,Ds] 统一成 [B,T,Ds].
+        """
+        if spatial_seq.dim() == 2:
+            # [B,Ds] -> 复制到每个时间步
+            spatial_seq = spatial_seq.unsqueeze(1).expand(-1, T, -1)
+        elif spatial_seq.dim() == 3:
+            pass
+        else:
+            raise ValueError(f"spatial_seq must be [B,Ds] or [B,T,Ds], got {spatial_seq.shape}")
+        return spatial_seq
+
+    @staticmethod
+    def _temporal_reduce_mean(x: torch.Tensor) -> torch.Tensor:
+        """ [B,T,D] -> [B,D] """
+        return x.mean(dim=1)
+
+    # def forward(
+    #     self,
+    #     motion_x: torch.Tensor,
+    #     spatial_seq: torch.Tensor = None,    # 可选 [B,T,Ds] 或 [B,Ds]
+    #     return_att: bool = True
+    # ):
+    #     # 1) 运动路径编码到时序嵌入
+    #     z = self.motion_enc(motion_x)            # [B,T,Dm]
+    #     # z = self.temporal(z)                 
+
+    #     # 2) 注意力时间池化（来自运动分支）
+    #     # attw 是 Attention Pooling 模块输出的时间注意力权重 [B,T]，
+    #     # 表示模型在每个时间步上对视频帧的重要程度。
+    #     motion_pooled, attw = self.pool(z)       # [B,Dm], [B,T]
+    #     # print(f'\nmotion_pooled {motion_pooled.size()}') torch.Size([4, 256])
+    #     # print(f'attw {attw.size()}\n') torch.Size([4, 8])
+    #     h_motion = self.proj_motion(motion_pooled)   # [B,H]
+
+    #     # 3) 空间特征融合: fuse motion and spatial
+    #     if self.fuse_spatial and spatial_seq is not None:
+    #         B, T, _ = z.shape
+    #         spatial_seq = self._ensure_bt_feat(spatial_seq, T) # make sure output is [B,T,Ds]
+    #         # 与运动的 attw 对齐，用同一时间权重进行加权平均（保持与时序关注一致）
+    #         # attw: [B,T] -> [B,T,1]
+    #         att = attw.unsqueeze(-1)                    # [B,T,1]
+
+    #         ###################### Downsample spatial_seq to T_m
+    #         spatial_seq = spatial_seq.transpose(1, 2)              # [B, Ds, T_s]
+    #         spatial_seq = F.adaptive_avg_pool1d(spatial_seq, attw.size(1))  # -> T_m
+    #         spatial_seq = spatial_seq.transpose(1, 2)              # [B, T_m, Ds]
+    #         s_weighted = (spatial_seq * att).sum(1)                 # [B, Ds]
+    #         ######################
+
+    #         # 给每一帧的空间特征加上时间权重, 在时间维上做加权求和，得到视频级的空间特征 [B,Ds]
+    #         # 1. 因为运动分支已经学会哪些帧更重要，那就用同样的注意力权重来汇聚空间特征
+    #         # print(f'\nspatial_seq {spatial_seq.size()}') torch.Size([4, 8, 384])
+    #         # print(f'\natt {att.size()}') torch.Size([4, 8, 1])
+
+    #         h_spatial = self.proj_spatial(s_weighted)   # [B,H] 对汇聚后的空间特征做投影, 与运动特征的 hidden_dim 对齐
+
+    #         if self.fusion_mode == "concat":
+    #             h_fused = torch.cat([h_motion, h_spatial], dim=-1)  # [B,2H]
+    #         else:  # gated_add
+    #             # 2. 让模型自动学习“该用多少空间特征
+    #             gate = self.gate(torch.cat([h_motion, h_spatial], dim=-1))  # [B,H] in [0,1]
+    #             h_fused = h_motion + gate * h_spatial                       # [B,H]
+    #     else:
+    #         h_fused = h_motion
+
+    #     # 4) 分类头
+    #     feat = self.head(h_fused)                # [B,F]
+    #     logits = self.fc(feat)                   # [B,num_classes]
+    #     ord_logits = self.fc_ord(feat) if self.fc_ord is not None else None
+
+    #     # attw: 时间注意力权重, 表示模型在每个时间帧上的关注程度
+    #     # ord_logits: num_classes - 1
+    #     if return_att:
+    #         return logits, ord_logits, attw
+    #     return logits, ord_logits
+
+
+    def forward(
+        self,
+        motion_x: torch.Tensor,
+        spatial_seq: torch.Tensor = None,
+        return_att: bool = True
+    ):
+        """
+        If self.use_motion == False:
+          - ignore motion_x
+          - use uniform temporal weights
+          - rely only on spatial branch if available
+        """
+
+        B = motion_x.size(0) if motion_x is not None else (spatial_seq.size(0) if spatial_seq is not None else None)
+        # You still want a time dimension T, from motion or spatial
+        if self.use_motion:
+            # 1) motion encoder
+            z = self.motion_enc(motion_x)          # [B,T,Dm]
+            motion_pooled, attw = self.pool(z)     # [B,Dm], [B,T]
+            h_motion = self.proj_motion(motion_pooled)   # [B,H]
+        else:
+            # ---- NO MOTION: create dummy attention + no motion feature ----
+            if spatial_seq is None:
+                raise ValueError("use_motion=False but spatial_seq is None; "
+                                 "need spatial features if you disable motion.")
+
+            # infer T from spatial_seq
+            if spatial_seq.dim() == 2:
+                T = 1
+            elif spatial_seq.dim() == 3:
+                T = spatial_seq.size(1)
+            else:
+                raise ValueError(f"Bad spatial_seq shape: {spatial_seq.shape}")
+
+            # uniform attention weights over time: [B,T]
+            attw = torch.full(
+                (B, T),
+                1.0 / T,
+                device=spatial_seq.device,
+                dtype=spatial_seq.dtype,
+            )
+            # no motion feature: zeros
+            h_motion = torch.zeros(
+                B,
+                self.hidden_dim,
+                device=spatial_seq.device,
+                dtype=spatial_seq.dtype,
+            )
+            z = None  # not used in this branch
+
+        # 3) spatial fusion
+        if self.fuse_spatial and spatial_seq is not None:
+            # we still use attw to aggregate spatial features (even if uniform)
+            if self.use_motion:
+                Bz, Tm, _ = z.shape
+                T = Tm
+            else:
+                T = attw.size(1)
+
+            spatial_seq = self._ensure_bt_feat(spatial_seq, T)   # [B,T,Ds]
+
+            # downsample (if needed) to match attw length
+            att = attw.unsqueeze(-1)                             # [B,T,1]
+
+            spatial_seq_ds = spatial_seq.transpose(1, 2)         # [B,Ds,T]
+            spatial_seq_ds = F.adaptive_avg_pool1d(spatial_seq_ds, attw.size(1))
+            spatial_seq_ds = spatial_seq_ds.transpose(1, 2)      # [B,T,Ds]
+
+            s_weighted = (spatial_seq_ds * att).sum(1)           # [B,Ds]
+
+            h_spatial = self.proj_spatial(s_weighted)            # [B,H]
+
+            if self.use_motion:
+                if self.fusion_mode == "concat":
+                    h_fused = torch.cat([h_motion, h_spatial], dim=-1)  # [B,2H]
+                else:
+                    gate = self.gate(torch.cat([h_motion, h_spatial], dim=-1))  # [B,H]
+                    h_fused = h_motion + gate * h_spatial                       # [B,H]
+            else:
+                # NO MOTION: just use spatial feature
+                h_fused = h_spatial
+        else:
+            # no spatial branch
+            h_fused = h_motion
+
+        # 4) classifier head
+        feat = self.head(h_fused)               # [B,F]
+        logits = self.fc(feat)                  # [B,num_classes]
+        ord_logits = self.fc_ord(feat) if self.fc_ord is not None else None
+
+        if return_att:
+            return logits, ord_logits, attw
+        return logits, ord_logits                               class MotionEncoder3D(nn.Module):
+    def __init__(self, in_ch=2, out_dim=96): # ↓ from 256 TODO 96 128
+        super().__init__()
+        self.net = nn.Sequential(
+        nn.Conv3d(in_ch, 16, kernel_size=(3,7,7), stride=(1,2,2), padding=(1,3,3)), nn.GELU(),
+        nn.Conv3d(16, 32, kernel_size=(3,3,3), stride=(2,2,2), padding=1), nn.GELU(),
+        nn.Conv3d(32, 64, kernel_size=(3,3,3), stride=(2,2,2), padding=1), nn.GELU(),
+        nn.AdaptiveAvgPool3d((None,1,1))
+        )
+        self.proj = nn.Linear(64, out_dim) # ↓ from 128→256
+
+    def forward(self, x):
+        x = x.permute(0,2,1,3,4)
+        x = self.net(x) # [B,64,T',1,1]
+        x = x.squeeze(-1).squeeze(-1) # [B,64,T']
+        x = self.proj(x.transpose(1,2)) # [B,T',out_dim]
+        return x
+    given the architecture, can you write the section of resolution predictor? 
+
+
+
