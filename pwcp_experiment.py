@@ -28,13 +28,14 @@ BG_COLOR = "black"
 TEXT_COLOR = "white"
 ISI = 0.25            # gap between videos (s)
 RANDOMIZE_ORDER = True  # AB vs BA randomization per trial
-RESPONSE_KEYS = ["left", "right", "escape"]  # ←=first video, →=second video
+RESPONSE_KEYS = ["left", "right", "escape", "backspace"]  # ←=first video, →=second video
 
 results_folder = f"results{reference_resolution}"
 os.makedirs(results_folder, exist_ok=True)
 
 # Define CSV file path
-csv_path = f"{results_folder}/pairwise_{datetime.now().strftime('%Y_%m_%d_%H_%M')}.csv"
+username = 'yaru'
+csv_path = f"{results_folder}/{username}_pairwise_{datetime.now().strftime('%Y_%m_%d_%H_%M')}.csv"
 OUTPUT_CSV = os.path.join(os.getcwd(), csv_path)
 
 start_time = time.time()
@@ -46,9 +47,13 @@ def message(win, text, wait_key=True, kb=None, height=24):
     msg = visual.TextStim(win, text=text, color=TEXT_COLOR, height=height, wrapWidth=1400)
     msg.draw()
     win.flip()
-    if wait_key:
+    # if wait_key:
+    #     kb.clearEvents()
+    #     kb.waitKeys()
+    if wait_key and kb is not None:
         kb.clearEvents()
-        kb.waitKeys()
+        kb.waitKeys(keyList=RESPONSE_KEYS)  # only allow our defined keys
+
 
 
 def main():
@@ -57,16 +62,6 @@ def main():
     screens = display.get_screens()
     num_screens = len(screens)
     print(f"Detected {num_screens} screen(s).")
-
-    # # Use the last one (usually the external monitor)
-    # # SCREEN_INDEX = num_screens - 1
-    # SCREEN_INDEX = 0
-    # if FULLSCREEN:
-    #     # If fullscreen is True, the 'size' parameter is often ignored or set to the screen resolution by default
-    #     win = visual.Window(fullscr=FULLSCREEN, color=BG_COLOR, units="pix", waitBlanking=False, screen=SCREEN_INDEX,)
-    # else:
-    #     win = visual.Window(fullscr=FULLSCREEN, size=SIZE, color=BG_COLOR, units="pix", waitBlanking=False, screen=SCREEN_INDEX,)
-
 
     SCREEN_INDEX = 0
     scr = screens[SCREEN_INDEX]
@@ -185,11 +180,17 @@ def main():
             prompt.draw(); 
             win.flip()
             kb.clearEvents()
-            t0 = core.getTime()
+            # t0 = core.getTime()
             choice = None
+            
+            VALID_KEYS = ["left", "right", "escape", "esc", "backspace", "delete", "backspace (8)"]
 
             while True:
-                keys = kb.getKeys(waitRelease=False)
+                # keys = kb.getKeys(waitRelease=False)
+                keys = kb.getKeys(keyList=VALID_KEYS, waitRelease=False)
+                if not keys:
+                    continue
+
                 if keys:
                     k = keys[-1].name
                     print(f"Key pressed: {k}")  # <-- DEBUG print to see what PsychoPy reads
